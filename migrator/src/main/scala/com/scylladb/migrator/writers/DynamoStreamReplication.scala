@@ -76,50 +76,55 @@ object DynamoStreamReplication {
         }
         .getOrElse(SparkAWSCredentials.builder.build())
     ).foreachRDD { msgs =>
-      val rdd = msgs
+      val rawRdd = msgs
         .collect { case Some(item) => item: util.Map[String, AttributeValueV1] }
         .repartition(Runtime.getRuntime.availableProcessors() * 2)
+        .cache() // Cache as it will be used multiple times
 
-      val changes =
-        rdd
-          .groupBy { item =>
-            item.get(operationTypeColumn) match {
-              case `putOperation`    => "UPSERT"
-              case `deleteOperation` => "DELETE"
-              case _                 => "UNKNOWN"
-            }
-          }
-          .mapValues(_.size)
-          .collect()
-      if (changes.nonEmpty) {
-        log.info("Changes to be applied:")
-        for ((operation, count) <- changes) {
-          log.info(s"${operation}: ${count}")
-        }
+      if (rawRdd.isEmpty()) {
+        log.info("No changes to apply in this batch.")
       } else {
-        log.info("No changes to apply")
-      }
-
-      val writableRdd =
-        rdd.map { item =>
-          (
-            new Text,
-            new DynamoDBItemWritable(
-              item
-                .entrySet()
-                .stream()
-                .collect(
-                  Collectors.toMap(
-                    (e: util.Map.Entry[String, AttributeValueV1]) => e.getKey,
-                    (e: util.Map.Entry[String, AttributeValueV1]) =>
-                      AttributeValueUtils.fromV1(e.getValue)
-                  )
-                )
-            )
-          )
+        // Separate RDDs for upserts and deletes
+        val upsertRdd = rawRdd.filter { item =>
+          item.get(operationTypeColumn) == putOperation
         }
 
-      DynamoDB.writeRDD(target, renamesMap, writableRdd, targetTableDesc)(spark)
-    }
+        val deleteRdd = rawRdd.filter { item =>
+          item.get(operationTypeColumn) == deleteOperation
+        }
 
+        val upsertCount = upsertRdd.count()
+        val deleteCount = deleteRdd.count()
+
+        if (upsertCount > 0) {
+          log.info(s"Processing ${upsertCount} UPSERT operations.")
+          // Convert V1 AttributeValues to V2 for writing via Hadoop EMR connector
+          val writableUpsertRdd =
+            upsertRdd.map { itemV1 =>
+              val itemV2 = new util.HashMap[
+                String,
+                software.amazon.awssdk.services.dynamodb.model.AttributeValue]()
+              itemV1.forEach((key, valueV1) => {
+                // The _dynamo_op_type column is filtered out by writeRDD
+                itemV2.put(key, AttributeValueUtils.fromV1(valueV1))
+              })
+              (new Text, new DynamoDBItemWritable(itemV2))
+            }
+          DynamoDB.writeRDD(target, renamesMap, writableUpsertRdd, targetTableDesc)(spark)
+        } else {
+          log.info("No UPSERT operations in this batch.")
+        }
+
+        if (deleteCount > 0) {
+          log.info(s"Processing ${deleteCount} DELETE operations.")
+          // deleteRDD expects RDD[java.util.Map[String, AttributeValueV1]]
+          // The _dynamo_op_type column is not needed for deletion keys by deleteRDD,
+          // and keys are extracted based on table schema.
+          DynamoDB.deleteRDD(target, renamesMap, deleteRdd, targetTableDesc)(spark)
+        } else {
+          log.info("No DELETE operations in this batch.")
+        }
+      }
+      rawRdd.unpersist() // Unpersist the cached RDD
+    }
 }
