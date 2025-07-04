@@ -5,4 +5,4 @@ set -x
 
 export TERM=xterm-color
 
-sbt -mem 8192 migrator/assembly
+sbt -mem 8096 migrator/assembly
