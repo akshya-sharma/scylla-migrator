@@ -28,11 +28,13 @@ import com.amazonaws.services.dynamodbv2.model.{
 
 import java.util
 import scala.jdk.CollectionConverters._
+import software.amazon.awssdk.services.dynamodb.model.{ BatchWriteItemRequest, DeleteRequest, WriteRequest }
 
 object DynamoDB {
 
   val log = LogManager.getLogger("com.scylladb.migrator.writers.DynamoDB")
   private val operationTypeColumnName = "_dynamo_op_type"
+  private val MAX_BATCH_SIZE = 25 // DynamoDB limit for BatchWriteItem
 
   def writeRDD(target: TargetSettings.DynamoDB,
                renamesMap: Map[String, String],
@@ -105,54 +107,89 @@ object DynamoDB {
 
     rdd.foreachPartition { partitionIterator =>
       if (partitionIterator.nonEmpty) {
-        // Create a DynamoDB client for each partition.
-        // This client will be used to delete items from ScyllaDB/Alternator.
         val dynamoClient = DynamoUtils.buildDynamoClient(
           target.endpoint,
-          target.finalCredentials
-            .map(_.toProvider), // Corrected: Apply .toProvider and pass as creds
-          target.region // Corrected: Pass region as the third argument
+          target.finalCredentials.map(_.toProvider),
+          target.region
         )
 
-        partitionIterator.foreach { itemV1 =>
-          // itemV1 is java.util.Map[String, AttributeValueV1]
-          val itemKeyV2 = new util.HashMap[String, AttributeValueV2]()
+        // Group items into batches
+        partitionIterator.grouped(MAX_BATCH_SIZE).foreach { batch =>
+          val writeRequests = new util.ArrayList[WriteRequest]()
 
-          itemV1.asScala.foreach {
-            case (key, valueV1) =>
-              val targetKeyName = renamesMap.getOrElse(key, key) // Apply rename if exists
-              if (keySchema.contains(targetKeyName)) {
-                itemKeyV2.put(targetKeyName, AttributeValueUtils.fromV1(valueV1))
-              }
+          batch.foreach { itemV1 =>
+            val itemKeyV2 = new util.HashMap[String, AttributeValueV2]()
+            itemV1.asScala.foreach {
+              case (key, valueV1) =>
+                val targetKeyName = renamesMap.getOrElse(key, key)
+                if (keySchema.contains(targetKeyName)) {
+                  itemKeyV2.put(targetKeyName, AttributeValueUtils.fromV1(valueV1))
+                }
+            }
+
+            if (itemKeyV2.isEmpty) {
+              log.warn(s"Skipping delete for item as no key attributes found after mapping. Original item keys: ${itemV1
+                .keySet()
+                .asScala
+                .mkString(", ")}. Renamed keys for schema: ${itemKeyV2.keySet().asScala.mkString(", ")}")
+            } else if (itemKeyV2.size() != keySchema.size) {
+              log.warn(s"Skipping delete for item due to mismatch in key attributes. Expected: ${keySchema.mkString(
+                ", ")}, Found: ${itemKeyV2.keySet().asScala.mkString(", ")}. Original item: ${itemV1}")
+            } else {
+              val deleteRequest = DeleteRequest.builder().key(itemKeyV2).build()
+              writeRequests.add(WriteRequest.builder().deleteRequest(deleteRequest).build())
+            }
           }
 
-          if (itemKeyV2.isEmpty) {
-            log.warn(s"Skipping delete for item as no key attributes found after mapping. Original item keys: ${itemV1
-              .keySet()
-              .asScala
-              .mkString(", ")}. Renamed keys for schema: ${itemKeyV2.keySet().asScala.mkString(", ")}")
-          } else if (itemKeyV2.size() != keySchema.size) {
-            log.warn(s"Skipping delete for item due to mismatch in key attributes. Expected: ${keySchema.mkString(
-              ", ")}, Found: ${itemKeyV2.keySet().asScala.mkString(", ")}. Original item: ${itemV1}")
-          } else {
-            try {
-              val deleteRequest = DeleteItemRequest
-                .builder()
-                .tableName(target.table)
-                .key(itemKeyV2)
-                .build()
+          if (!writeRequests.isEmpty) {
+            val requestItems = new util.HashMap[String, util.List[WriteRequest]]()
+            requestItems.put(target.table, writeRequests)
 
-              dynamoClient.deleteItem(deleteRequest)
-              log.debug(s"Deleted item with key ${itemKeyV2} from ${target.table}")
-            } catch {
-              case e: Exception =>
-                log.error(
-                  s"Failed to delete item with key ${itemKeyV2} from ${target.table}: ${e.getMessage}",
-                  e)
+            var batchWriteRequest = BatchWriteItemRequest.builder().requestItems(requestItems).build()
+            var unprocessedItems: util.Map[String, util.List[WriteRequest]] = null
+            var attempts = 0
+            val maxRetries = 5 // Configurable max retries
+
+            do {
+              try {
+                attempts += 1
+                log.info(s"Attempting to delete batch of ${writeRequests.size()} items from ${target.table}. Attempt #$attempts")
+                val batchWriteResponse = dynamoClient.batchWriteItem(batchWriteRequest)
+                unprocessedItems = batchWriteResponse.unprocessedItems()
+
+                if (unprocessedItems != null && !unprocessedItems.isEmpty) {
+                  log.warn(s"Batch delete resulted in ${unprocessedItems.get(target.table).size()} unprocessed items. Retrying...")
+                  batchWriteRequest = BatchWriteItemRequest.builder().requestItems(unprocessedItems).build()
+                  // Implement exponential backoff if needed
+                  Thread.sleep(1000 * attempts) // Simple linear backoff
+                } else {
+                  log.info(s"Successfully deleted batch of ${writeRequests.size()} items from ${target.table}.")
+                  unprocessedItems = null // Ensure loop termination
+                }
+              } catch {
+                case e: Exception =>
+                  log.error(
+                    s"Failed to delete batch from ${target.table} on attempt #$attempts: ${e.getMessage}",
+                    e)
+                  if (attempts >= maxRetries) {
+                    log.error(s"Exceeded max retries ($maxRetries) for batch delete. Giving up on this batch.")
+                    unprocessedItems = null // Ensure loop termination and skip this batch
+                  } else {
+                    // Prepare for retry, unprocessedItems will be used from the request if available,
+                    // otherwise, the whole batch is considered unprocessed for the next attempt.
+                    // This part might need more sophisticated handling if partial success occurs within a batch that throws an exception.
+                    // For simplicity, we retry the last `batchWriteRequest`.
+                    Thread.sleep(1000 * attempts) // Simple linear backoff before retrying the same batch
+                  }
+              }
+            } while (unprocessedItems != null && !unprocessedItems.isEmpty && attempts < maxRetries)
+
+            if (unprocessedItems != null && !unprocessedItems.isEmpty) {
+              log.error(s"Failed to delete ${unprocessedItems.get(target.table).size()} items from ${target.table} after $maxRetries retries. These items will be skipped.")
             }
           }
         }
-        dynamoClient.close() // Close client when partition processing is done
+        dynamoClient.close()
       }
     }
   }
