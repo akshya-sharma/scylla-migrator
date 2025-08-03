@@ -39,4 +39,42 @@ object DdbValue {
     else if (value.hasNs) Ns(value.ns().asScala)
     else if (value.hasBs) Bs(value.bs().asScala)
     else sys.error("Unknown AttributeValue type")
+
+  def toV2(value: DdbValue): AttributeValue = {
+    val builder = AttributeValue.builder()
+    value match {
+      case S(v)    => builder.s(v)
+      case N(v)    => builder.n(v)
+      case Bool(v) => builder.bool(v)
+      case L(v)    => builder.l(v.map(toV2).asJava)
+      case Null(v) => builder.nul(v)
+      case B(v)    => builder.b(v)
+      case M(v)    => builder.m(v.view.mapValues(toV2).toMap.asJava)
+      case Ss(v)   => builder.ss(v.asJava)
+      case Ns(v)   => builder.ns(v.asJava)
+      case Bs(v)   => builder.bs(v.asJava)
+    }
+    builder.build()
+  }
+
+  def toV1(value: DdbValue): com.amazonaws.services.dynamodbv2.model.AttributeValue =
+    value match {
+      case S(v)    => new com.amazonaws.services.dynamodbv2.model.AttributeValue().withS(v)
+      case N(v)    => new com.amazonaws.services.dynamodbv2.model.AttributeValue().withN(v)
+      case Bool(v) => new com.amazonaws.services.dynamodbv2.model.AttributeValue().withBOOL(v)
+      case L(v) =>
+        new com.amazonaws.services.dynamodbv2.model.AttributeValue().withL(v.map(toV1).asJava)
+      case Null(v) => new com.amazonaws.services.dynamodbv2.model.AttributeValue().withNULL(v)
+      case B(v) =>
+        new com.amazonaws.services.dynamodbv2.model.AttributeValue()
+          .withB(java.nio.ByteBuffer.wrap(v.asByteArray()))
+      case M(v) =>
+        new com.amazonaws.services.dynamodbv2.model.AttributeValue()
+          .withM(v.view.mapValues(toV1).toMap.asJava)
+      case Ss(v) => new com.amazonaws.services.dynamodbv2.model.AttributeValue().withSS(v.asJava)
+      case Ns(v) => new com.amazonaws.services.dynamodbv2.model.AttributeValue().withNS(v.asJava)
+      case Bs(v) =>
+        new com.amazonaws.services.dynamodbv2.model.AttributeValue()
+          .withBS(v.map(b => java.nio.ByteBuffer.wrap(b.asByteArray())).asJava)
+    }
 }
