@@ -28,12 +28,16 @@ import com.amazonaws.services.dynamodbv2.model.{
 
 import java.util
 import scala.jdk.CollectionConverters._
-import software.amazon.awssdk.services.dynamodb.model.{ BatchWriteItemRequest, DeleteRequest, WriteRequest }
+import software.amazon.awssdk.services.dynamodb.model.{
+  BatchWriteItemRequest,
+  DeleteRequest,
+  WriteRequest
+}
 
 object DynamoDB {
 
   val log = LogManager.getLogger("com.scylladb.migrator.writers.DynamoDB")
-  private val operationTypeColumnName = "_dynamo_op_type"
+  //private val operationTypeColumnName = "_dynamo_op_type"
   private val MAX_BATCH_SIZE = 25 // DynamoDB limit for BatchWriteItem
 
   def writeRDD(target: TargetSettings.DynamoDB,
@@ -69,31 +73,23 @@ object DynamoDB {
       DynamoDBConstants.THROUGHPUT_WRITE_PERCENT,
       target.throughputWritePercent.map(_.toString))
 
-    // Map over the RDD to potentially modify items
-    val processedRdd = rdd.mapValues { itemWritable =>
-      val item = itemWritable.getItem // This is a java.util.Map[String, software.amazon.awssdk.services.dynamodb.model.AttributeValue] (SDK V2)
-
-      // Remove the operationTypeColumnName attribute as it's not part of the actual table schema
-      val filteredScalaMap = item.asScala.view.filterKeys(_ != operationTypeColumnName).toMap
-      val modifiedItem = new java.util.HashMap[String, AttributeValueV2]()
-      filteredScalaMap.foreach { case (k, v) => modifiedItem.put(k, v) }
-      val newItemWritable = new DynamoDBItemWritable()
-      newItemWritable.setItem(modifiedItem)
-      newItemWritable
-    }
-
     val finalRdd =
-      if (renamesMap.isEmpty) processedRdd
+      if (renamesMap.isEmpty) rdd
       else
-        processedRdd.mapValues { itemWritable =>
+        rdd.mapValues { itemWritable =>
           val item = new util.HashMap[String, AttributeValueV2]()
           // Apply renames to keys
           itemWritable.getItem.forEach { (key, value) =>
+            // The value here is already an AttributeValueV2
             item.put(renamesMap.getOrElse(key, key), value)
           }
           itemWritable.setItem(item)
           itemWritable
         }
+
+    //print rdd contents
+    //finalRdd.foreach(item => log.info(s"Writing item: ${item._2.getItem.asScala.mkString(", ")}"))
+
     finalRdd.saveAsHadoopDataset(jobConf)
   }
 
@@ -128,13 +124,15 @@ object DynamoDB {
             }
 
             if (itemKeyV2.isEmpty) {
-              log.warn(s"Skipping delete for item as no key attributes found after mapping. Original item keys: ${itemV1
-                .keySet()
-                .asScala
-                .mkString(", ")}. Renamed keys for schema: ${itemKeyV2.keySet().asScala.mkString(", ")}")
+              log.warn(
+                s"Skipping delete for item as no key attributes found after mapping. Original item keys: ${itemV1
+                  .keySet()
+                  .asScala
+                  .mkString(", ")}. Renamed keys for schema: ${itemKeyV2.keySet().asScala.mkString(", ")}")
             } else if (itemKeyV2.size() != keySchema.size) {
-              log.warn(s"Skipping delete for item due to mismatch in key attributes. Expected: ${keySchema.mkString(
-                ", ")}, Found: ${itemKeyV2.keySet().asScala.mkString(", ")}. Original item: ${itemV1}")
+              log.warn(
+                s"Skipping delete for item due to mismatch in key attributes. Expected: ${keySchema.mkString(
+                  ", ")}, Found: ${itemKeyV2.keySet().asScala.mkString(", ")}. Original item: ${itemV1}")
             } else {
               val deleteRequest = DeleteRequest.builder().key(itemKeyV2).build()
               writeRequests.add(WriteRequest.builder().deleteRequest(deleteRequest).build())
@@ -145,7 +143,8 @@ object DynamoDB {
             val requestItems = new util.HashMap[String, util.List[WriteRequest]]()
             requestItems.put(target.table, writeRequests)
 
-            var batchWriteRequest = BatchWriteItemRequest.builder().requestItems(requestItems).build()
+            var batchWriteRequest =
+              BatchWriteItemRequest.builder().requestItems(requestItems).build()
             var unprocessedItems: util.Map[String, util.List[WriteRequest]] = null
             var attempts = 0
             val maxRetries = 5 // Configurable max retries
@@ -153,17 +152,21 @@ object DynamoDB {
             do {
               try {
                 attempts += 1
-                log.info(s"Attempting to delete batch of ${writeRequests.size()} items from ${target.table}. Attempt #$attempts")
+                log.info(
+                  s"Attempting to delete batch of ${writeRequests.size()} items from ${target.table}. Attempt #$attempts")
                 val batchWriteResponse = dynamoClient.batchWriteItem(batchWriteRequest)
                 unprocessedItems = batchWriteResponse.unprocessedItems()
 
                 if (unprocessedItems != null && !unprocessedItems.isEmpty) {
-                  log.warn(s"Batch delete resulted in ${unprocessedItems.get(target.table).size()} unprocessed items. Retrying...")
-                  batchWriteRequest = BatchWriteItemRequest.builder().requestItems(unprocessedItems).build()
+                  log.warn(
+                    s"Batch delete resulted in ${unprocessedItems.get(target.table).size()} unprocessed items. Retrying...")
+                  batchWriteRequest =
+                    BatchWriteItemRequest.builder().requestItems(unprocessedItems).build()
                   // Implement exponential backoff if needed
                   Thread.sleep(1000 * attempts) // Simple linear backoff
                 } else {
-                  log.info(s"Successfully deleted batch of ${writeRequests.size()} items from ${target.table}.")
+                  log.info(
+                    s"Successfully deleted batch of ${writeRequests.size()} items from ${target.table}.")
                   unprocessedItems = null // Ensure loop termination
                 }
               } catch {
@@ -172,7 +175,8 @@ object DynamoDB {
                     s"Failed to delete batch from ${target.table} on attempt #$attempts: ${e.getMessage}",
                     e)
                   if (attempts >= maxRetries) {
-                    log.error(s"Exceeded max retries ($maxRetries) for batch delete. Giving up on this batch.")
+                    log.error(
+                      s"Exceeded max retries ($maxRetries) for batch delete. Giving up on this batch.")
                     unprocessedItems = null // Ensure loop termination and skip this batch
                   } else {
                     // Prepare for retry, unprocessedItems will be used from the request if available,
@@ -185,7 +189,8 @@ object DynamoDB {
             } while (unprocessedItems != null && !unprocessedItems.isEmpty && attempts < maxRetries)
 
             if (unprocessedItems != null && !unprocessedItems.isEmpty) {
-              log.error(s"Failed to delete ${unprocessedItems.get(target.table).size()} items from ${target.table} after $maxRetries retries. These items will be skipped.")
+              log.error(
+                s"Failed to delete ${unprocessedItems.get(target.table).size()} items from ${target.table} after $maxRetries retries. These items will be skipped.")
             }
           }
         }
