@@ -37,7 +37,7 @@ import software.amazon.awssdk.services.dynamodb.model.{
 object DynamoDB {
 
   val log = LogManager.getLogger("com.scylladb.migrator.writers.DynamoDB")
-  private val operationTypeColumnName = "_dynamo_op_type"
+  //private val operationTypeColumnName = "_dynamo_op_type"
   private val MAX_BATCH_SIZE = 25 // DynamoDB limit for BatchWriteItem
 
   def writeRDD(target: TargetSettings.DynamoDB,
@@ -73,31 +73,23 @@ object DynamoDB {
       DynamoDBConstants.THROUGHPUT_WRITE_PERCENT,
       target.throughputWritePercent.map(_.toString))
 
-    // Map over the RDD to potentially modify items
-    val processedRdd = rdd.mapValues { itemWritable =>
-      val item = itemWritable.getItem // This is a java.util.Map[String, software.amazon.awssdk.services.dynamodb.model.AttributeValue] (SDK V2)
-
-      // Remove the operationTypeColumnName attribute as it's not part of the actual table schema
-      val filteredScalaMap = item.asScala.view.filterKeys(_ != operationTypeColumnName).toMap
-      val modifiedItem = new java.util.HashMap[String, AttributeValueV2]()
-      filteredScalaMap.foreach { case (k, v) => modifiedItem.put(k, v) }
-      val newItemWritable = new DynamoDBItemWritable()
-      newItemWritable.setItem(modifiedItem)
-      newItemWritable
-    }
-
     val finalRdd =
-      if (renamesMap.isEmpty) processedRdd
+      if (renamesMap.isEmpty) rdd
       else
-        processedRdd.mapValues { itemWritable =>
+        rdd.mapValues { itemWritable =>
           val item = new util.HashMap[String, AttributeValueV2]()
           // Apply renames to keys
           itemWritable.getItem.forEach { (key, value) =>
+            // The value here is already an AttributeValueV2
             item.put(renamesMap.getOrElse(key, key), value)
           }
           itemWritable.setItem(item)
           itemWritable
         }
+
+    //print rdd contents
+    //finalRdd.foreach(item => log.info(s"Writing item: ${item._2.getItem.asScala.mkString(", ")}"))
+
     finalRdd.saveAsHadoopDataset(jobConf)
   }
 

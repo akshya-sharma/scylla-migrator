@@ -26,6 +26,8 @@ object DynamoStreamReplication {
 
   // We enrich the table items with a column `operationTypeColumn` describing the type of change
   // applied to the item.
+  // We have to deal with multiple representation of the data because `spark-kinesis-dynamodb`
+  // uses the AWS SDK V1, whereas `emr-dynamodb-hadoop` uses the AWS SDK V2
   private val operationTypeColumn = "_dynamo_op_type"
   private val sequenceNumberColumn = "_dynamo_sequence_number"
   private val putOperation = new AttributeValueV1().withBOOL(true)
@@ -46,24 +48,41 @@ object DynamoStreamReplication {
       messageHandler = {
         case recAdapter: RecordAdapter =>
           val rec = recAdapter.getInternalObject
-          val newMap = new util.HashMap[String, AttributeValueV1]()
+          val dynamoRecord = rec.getDynamodb
 
-          if (rec.getDynamodb.getNewImage ne null) {
-            newMap.putAll(rec.getDynamodb.getNewImage)
+          val itemV1 = new util.HashMap[String, AttributeValueV1]
+
+          val operationType = rec.getEventName match {
+            case "INSERT" | "MODIFY" =>
+              if (dynamoRecord.getNewImage ne null) {
+                itemV1.putAll(dynamoRecord.getNewImage)
+              }
+              putOperation
+            case "REMOVE" =>
+              if (dynamoRecord.getKeys ne null) {
+                itemV1.putAll(dynamoRecord.getKeys)
+              }
+              deleteOperation
           }
 
-          newMap.putAll(rec.getDynamodb.getKeys)
+          if (itemV1.isEmpty) {
+            None // Should not happen for valid records, but good to be safe
+          } else {
+            itemV1.put(operationTypeColumn, operationType)
+            // need SequenceNumber for ordering events in stream
+            itemV1.put(
+              sequenceNumberColumn,
+              new AttributeValueV1().withN(dynamoRecord.getSequenceNumber))
 
-          val operationType =
-            rec.getEventName match {
-              case "INSERT" | "MODIFY" => putOperation
-              case "REMOVE"            => deleteOperation
-            }
-          newMap.put(operationTypeColumn, operationType)
-          newMap.put(
-            sequenceNumberColumn,
-            new AttributeValueV1().withN(rec.getDynamodb.getSequenceNumber))
-          Some(newMap)
+            // Convert to a serializable representation right away to avoid issues
+            // with non-serializable ByteBuffers in the stream
+            val ddbValueMap = itemV1.asScala.map {
+              case (k, v) => k -> DdbValue.from(AttributeValueUtils.fromV1(v))
+            }.toMap
+            // Add log to print contents of the item ddbValueMap            l
+            //log.info(s"Processing item from stream: ${ddbValueMap.mkString(", ")}")
+            Some(ddbValueMap)
+          }
 
         case _ => None
       },
@@ -79,29 +98,22 @@ object DynamoStreamReplication {
             builder.build()
         }
         .getOrElse(SparkAWSCredentials.builder.build())
-    ).foreachRDD { msgs =>
-      val rawRdd = msgs.collect { case Some(item) => item }
+    ).foreachRDD { rdd =>
+      //rdd.foreach(item => log.info(s"rdd RDD item: ${item.mkString(", ")}"))
 
-      if (rawRdd.isEmpty()) {
+      if (rdd.isEmpty()) {
         log.info("No changes to apply in this batch.")
       } else {
         // To preserve the ordering of operations, we first de-duplicate the changes in the
         // micro-batch, keeping only the last change for each item, according to the
         // stream sequence number.
-        //
-        // Because the AWS SDK V1 data types are not serializable, we first need to convert
-        // the items to our serializable DdbValue representation.
-        val serializableRdd = rawRdd
-          .map { itemV1 =>
-            itemV1.asScala.map { case (k, v) => k -> DdbValue.from(AttributeValueUtils.fromV1(v)) }.toMap
-          }
-          .repartition(Runtime.getRuntime.availableProcessors() * 2)
 
         val keySchemaNames = targetTableDesc.keySchema.asScala.map(_.attributeName)
 
         // Group by primary key and find the latest operation for each key
-        val latestOperationsRdd = serializableRdd
-          .keyBy(item => keySchemaNames.map(k => item(k)).toList)
+        val latestOperationsRdd = rdd
+          .flatMap(identity)
+          .keyBy(item => keySchemaNames.map(k => item(k)))
           .reduceByKey { (op1, op2) =>
             val seqNum1 = BigInt(op1(sequenceNumberColumn).asInstanceOf[DdbValue.N].value)
             val seqNum2 = BigInt(op2(sequenceNumberColumn).asInstanceOf[DdbValue.N].value)
@@ -109,6 +121,10 @@ object DynamoStreamReplication {
           }
           .values
           .cache()
+
+        // print contents of latestOperationsRdd
+        // latestOperationsRdd.foreach(item =>
+        //  log.info(s"latestOperationsRdd RDD item: ${item.mkString(", ")}"))
 
         val putOperationDdb = DdbValue.from(AttributeValueUtils.fromV1(putOperation))
         val deleteOperationDdb = DdbValue.from(AttributeValueUtils.fromV1(deleteOperation))
@@ -124,6 +140,9 @@ object DynamoStreamReplication {
         val upsertCount = upsertRdd.count()
         val deleteCount = deleteRdd.count()
 
+        //print contents of upsertRdd
+        //upsertRdd.foreach(item => log.info(s"Upsert RDD item: ${item.mkString(", ")}"))
+
         if (upsertCount > 0) {
           log.info(s"Processing ${upsertCount} UPSERT operations.")
           // Convert DdbValue to V2 for writing via Hadoop EMR connector
@@ -136,6 +155,11 @@ object DynamoStreamReplication {
               .foreach { case (key, ddbValue) => itemV2.put(key, DdbValue.toV2(ddbValue)) }
             (new Text, new DynamoDBItemWritable(itemV2))
           }
+
+          // print contents of writableUpsertRdd
+          //writableUpsertRdd.foreach(item =>
+          //  log.info(s"Upserting item: ${item._2.getItem.asScala.mkString(", ")}"))
+
           DynamoDB.writeRDD(target, renamesMap, writableUpsertRdd, targetTableDesc)(spark)
         } else {
           log.info("No UPSERT operations in this batch.")
