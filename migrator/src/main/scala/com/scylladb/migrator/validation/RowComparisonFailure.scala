@@ -206,6 +206,13 @@ object RowComparisonFailure {
         !l.sameElements(r)
 
       // Special cases for DynamoDB item values
+      // B and Bs are case classes wrapping Array[Byte] and Seq[Array[Byte]].
+      // Arrays must be compared for content equality.
+      case (Some(DdbValue.B(l)), Some(DdbValue.B(r))) => !l.sameElements(r)
+      case (Some(DdbValue.Bs(l)), Some(DdbValue.Bs(r))) =>
+        l.size != r.size || l.zip(r).exists {
+          case (lArray, rArray) => !lArray.sameElements(rArray)
+        }
       case (Some(DdbValue.N(l)), Some(DdbValue.N(r))) =>
         areNumericalValuesDifferent(BigDecimal(l), BigDecimal(r), floatingPointTolerance)
       case (Some(DdbValue.Ns(l)), Some(DdbValue.Ns(r))) =>
