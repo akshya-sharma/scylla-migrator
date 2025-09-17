@@ -10,6 +10,7 @@ import org.apache.log4j.LogManager
 import com.scylladb.migrator.AttributeValueUtils // Required for V1 to V2 conversion
 import com.scylladb.migrator.DynamoUtils
 import com.scylladb.migrator.DynamoUtils.{ setDynamoDBJobConf, setOptionalConf }
+import com.scylladb.migrator.alternator.DdbValue
 import com.scylladb.migrator.config.TargetSettings
 import org.apache.hadoop.dynamodb.{ DynamoDBConstants, DynamoDBItemWritable }
 import org.apache.hadoop.io.Text
@@ -17,20 +18,18 @@ import org.apache.hadoop.mapred.JobConf
 import org.apache.log4j.LogManager
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
-import software.amazon.awssdk.services.dynamodb.model.{
-  AttributeValue => AttributeValueV2, // Alias for AWS SDK V2 AttributeValue
-  DeleteItemRequest,
-  TableDescription
-}
-import com.amazonaws.services.dynamodbv2.model.{
-  AttributeValue => AttributeValueV1
-} // AWS SDK V1 AttributeValue
+
+//import com.amazonaws.services.dynamodbv2.model.{
+//  AttributeValue => AttributeValueV1
+//} // AWS SDK V1 AttributeValue
 
 import java.util
 import scala.jdk.CollectionConverters._
 import software.amazon.awssdk.services.dynamodb.model.{
+  AttributeValue => AttributeValueV2, // Alias for AWS SDK V2 AttributeValue
   BatchWriteItemRequest,
   DeleteRequest,
+  TableDescription,
   WriteRequest
 }
 
@@ -93,10 +92,11 @@ object DynamoDB {
     finalRdd.saveAsHadoopDataset(jobConf)
   }
 
-  def deleteRDD(target: TargetSettings.DynamoDB,
-                renamesMap: Map[String, String], // For mapping key names if they were renamed
-                rdd: RDD[java.util.Map[String, AttributeValueV1]], // Items from stream are V1
-                targetTableDesc: TableDescription)(implicit spark: SparkSession): Unit = {
+  def deleteRDD(
+    target: TargetSettings.DynamoDB,
+    renamesMap: Map[String, String], // For mapping key names if they were renamed
+    rdd: RDD[java.util.Map[String, DdbValue]], // Items from stream are serialized DdbValue
+    targetTableDesc: TableDescription)(implicit spark: SparkSession): Unit = {
 
     val keySchema = targetTableDesc.keySchema().asScala.map(_.attributeName()).toSet
     log.info(s"Key schema for deletions on table ${target.table}: ${keySchema.mkString(", ")}")
@@ -113,26 +113,26 @@ object DynamoDB {
         partitionIterator.grouped(MAX_BATCH_SIZE).foreach { batch =>
           val writeRequests = new util.ArrayList[WriteRequest]()
 
-          batch.foreach { itemV1 =>
+          batch.foreach { itemDdb =>
             val itemKeyV2 = new util.HashMap[String, AttributeValueV2]()
-            itemV1.asScala.foreach {
-              case (key, valueV1) =>
+            itemDdb.asScala.foreach {
+              case (key, ddbValue) =>
                 val targetKeyName = renamesMap.getOrElse(key, key)
                 if (keySchema.contains(targetKeyName)) {
-                  itemKeyV2.put(targetKeyName, AttributeValueUtils.fromV1(valueV1))
+                  itemKeyV2.put(targetKeyName, DdbValue.toV2(ddbValue))
                 }
             }
 
             if (itemKeyV2.isEmpty) {
               log.warn(
-                s"Skipping delete for item as no key attributes found after mapping. Original item keys: ${itemV1
+                s"Skipping delete for item as no key attributes found after mapping. Original item keys: ${itemDdb
                   .keySet()
                   .asScala
                   .mkString(", ")}. Renamed keys for schema: ${itemKeyV2.keySet().asScala.mkString(", ")}")
             } else if (itemKeyV2.size() != keySchema.size) {
               log.warn(
                 s"Skipping delete for item due to mismatch in key attributes. Expected: ${keySchema.mkString(
-                  ", ")}, Found: ${itemKeyV2.keySet().asScala.mkString(", ")}. Original item: ${itemV1}")
+                  ", ")}, Found: ${itemKeyV2.keySet().asScala.mkString(", ")}. Original item: ${itemDdb}")
             } else {
               val deleteRequest = DeleteRequest.builder().key(itemKeyV2).build()
               writeRequests.add(WriteRequest.builder().deleteRequest(deleteRequest).build())

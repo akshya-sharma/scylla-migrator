@@ -99,20 +99,21 @@ object DynamoStreamReplication {
         }
         .getOrElse(SparkAWSCredentials.builder.build())
     ).foreachRDD { rdd =>
-      //rdd.foreach(item => log.info(s"rdd RDD item: ${item.mkString(", ")}"))
+      // The message handler returns Option[Map[...]], so we need to unwrap the Options
+      // and filter out the Nones before processing.
+      val processedRdd = rdd.collect { case Some(item) => item }
 
-      if (rdd.isEmpty()) {
+      if (processedRdd.isEmpty()) {
         log.info("No changes to apply in this batch.")
       } else {
         // To preserve the ordering of operations, we first de-duplicate the changes in the
         // micro-batch, keeping only the last change for each item, according to the
         // stream sequence number.
 
-        val keySchemaNames = targetTableDesc.keySchema.asScala.map(_.attributeName)
+        val keySchemaNames = targetTableDesc.keySchema.asScala.map(_.attributeName).toSeq
 
         // Group by primary key and find the latest operation for each key
-        val latestOperationsRdd = rdd
-          .flatMap(identity)
+        val latestOperationsRdd = processedRdd
           .keyBy(item => keySchemaNames.map(k => item(k)))
           .reduceByKey { (op1, op2) =>
             val seqNum1 = BigInt(op1(sequenceNumberColumn).asInstanceOf[DdbValue.N].value)
@@ -120,11 +121,11 @@ object DynamoStreamReplication {
             if (seqNum1 > seqNum2) op1 else op2
           }
           .values
-          .cache()
+        //.cache()
 
         // print contents of latestOperationsRdd
-        // latestOperationsRdd.foreach(item =>
-        //  log.info(s"latestOperationsRdd RDD item: ${item.mkString(", ")}"))
+        latestOperationsRdd.foreach(item =>
+          log.info(s"latestOperationsRdd RDD item: ${item.mkString(", ")}"))
 
         val putOperationDdb = DdbValue.from(AttributeValueUtils.fromV1(putOperation))
         val deleteOperationDdb = DdbValue.from(AttributeValueUtils.fromV1(deleteOperation))
@@ -136,50 +137,42 @@ object DynamoStreamReplication {
         val deleteRdd = latestOperationsRdd.filter { item =>
           item(operationTypeColumn) == deleteOperationDdb
         }
+        // Persist the RDDs as they are used for a count and a write/delete operation.
+        upsertRdd.persist()
+        deleteRdd.persist()
 
-        val upsertCount = upsertRdd.count()
-        val deleteCount = deleteRdd.count()
+        try {
+          val upsertCount = upsertRdd.count()
+          val deleteCount = deleteRdd.count()
 
-        //print contents of upsertRdd
-        //upsertRdd.foreach(item => log.info(s"Upsert RDD item: ${item.mkString(", ")}"))
+          if (upsertCount > 0) {
+            log.info(s"Processing ${upsertCount} UPSERT operations.")
+            val writableUpsertRdd = upsertRdd.map { itemDdb =>
+              val itemV2 = new util.HashMap[
+                String,
+                software.amazon.awssdk.services.dynamodb.model.AttributeValue]()
+              itemDdb
+                .filterKeys(k => k != operationTypeColumn && k != sequenceNumberColumn)
+                .foreach { case (key, ddbValue) => itemV2.put(key, DdbValue.toV2(ddbValue)) }
+              (new Text, new DynamoDBItemWritable(itemV2))
+            }
 
-        if (upsertCount > 0) {
-          log.info(s"Processing ${upsertCount} UPSERT operations.")
-          // Convert DdbValue to V2 for writing via Hadoop EMR connector
-          val writableUpsertRdd = upsertRdd.map { itemDdb =>
-            val itemV2 = new util.HashMap[
-              String,
-              software.amazon.awssdk.services.dynamodb.model.AttributeValue]
-            itemDdb
-              .filterKeys(k => k != operationTypeColumn && k != sequenceNumberColumn)
-              .foreach { case (key, ddbValue) => itemV2.put(key, DdbValue.toV2(ddbValue)) }
-            (new Text, new DynamoDBItemWritable(itemV2))
+            DynamoDB.writeRDD(target, renamesMap, writableUpsertRdd, targetTableDesc)(spark)
+          } else {
+            log.info("No UPSERT operations in this batch.")
           }
 
-          // print contents of writableUpsertRdd
-          //writableUpsertRdd.foreach(item =>
-          //  log.info(s"Upserting item: ${item._2.getItem.asScala.mkString(", ")}"))
-
-          DynamoDB.writeRDD(target, renamesMap, writableUpsertRdd, targetTableDesc)(spark)
-        } else {
-          log.info("No UPSERT operations in this batch.")
+          if (deleteCount > 0) {
+            log.info(s"Processing ${deleteCount} DELETE operations.")
+            DynamoDB.deleteRDD(target, renamesMap, deleteRdd.map(_.asJava), targetTableDesc)(spark)
+          } else {
+            log.info("No DELETE operations in this batch.")
+          }
+        } finally {
+          // Unpersist the RDDs to free up memory in the cache.
+          upsertRdd.unpersist()
+          deleteRdd.unpersist()
         }
-
-        if (deleteCount > 0) {
-          log.info(s"Processing ${deleteCount} DELETE operations.")
-          // Convert DdbValue to V1 for deletion
-          val deleteItemsV1Rdd: RDD[util.Map[String, AttributeValueV1]] =
-            deleteRdd.map { itemDdb =>
-              val itemV1 = new util.HashMap[String, AttributeValueV1]
-              itemDdb.foreach { case (key, ddbValue) => itemV1.put(key, DdbValue.toV1(ddbValue)) }
-              itemV1
-            }
-          DynamoDB.deleteRDD(target, renamesMap, deleteItemsV1Rdd, targetTableDesc)(spark)
-        } else {
-          log.info("No DELETE operations in this batch.")
-        }
-
-        latestOperationsRdd.unpersist()
       }
     }
 }
